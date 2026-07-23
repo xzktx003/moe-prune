@@ -160,7 +160,7 @@ def patched_model_for_ace(
     moe_backend: str = "triton",
     min_keep: int = 1,
 ):
-    """Apply ACE using the maximum of normalized GSP and RCR scores."""
+    """Apply ACE using max(1.0 * normalized GSP, 0.1 * normalized RCR)."""
     common_layers = slanc_amp_table.keys() & proto_amp_table.keys()
     tau_by_layer = build_uniform_tau_by_layer(common_layers, tau)
     with patch_qwen3_moe_blocks_dual_view(

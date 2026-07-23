@@ -9,6 +9,7 @@ import torch
 from .model_structure import iter_moe_layer_bindings
 from .moe_cache_collector import compute_expert_outputs_local, route_qwen3_topk
 from .quantile_search import build_candidate_scores_from_p_final
+from .runtime_pruner import combine_ace_scores
 from .sere_selector import build_sere_dissimilarity_score
 from .top_p_selector import build_top_p_residual_score
 
@@ -101,7 +102,7 @@ def patched_model_for_quantile_collection(
                     score_proto = gate * proto_sel
                     p_amp = score_amp / (score_amp.sum(dim=-1, keepdim=True) + EPS)
                     p_proto = score_proto / (score_proto.sum(dim=-1, keepdim=True) + EPS)
-                    p_final = torch.maximum(p_amp, p_proto)
+                    p_final = combine_ace_scores(p_amp, p_proto)
                 elif method == "rcr":
                     assert proto_amp_tables is not None
                     proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
@@ -164,7 +165,7 @@ def patched_model_for_quantile_collection(
                     score_proto = gate * proto_sel
                     p_amp = score_amp / (score_amp.sum(dim=-1, keepdim=True) + EPS)
                     p_proto = score_proto / (score_proto.sum(dim=-1, keepdim=True) + EPS)
-                    p_final = torch.maximum(p_amp, p_proto)
+                    p_final = combine_ace_scores(p_amp, p_proto)
                 elif method == "rcr":
                     assert proto_amp_tables is not None
                     proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)

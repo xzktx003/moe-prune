@@ -16,6 +16,10 @@ from .triton_group_gemm import (
 )
 
 
+ACE_GSP_COEFFICIENT = 1.0
+ACE_RCR_COEFFICIENT = 0.1
+
+
 def route_qwen3_topk(
     router,
     hidden_states: torch.Tensor,
@@ -95,6 +99,22 @@ def build_keep_mask_topk(score: torch.Tensor, tau: float, eps: float = 1e-8) -> 
     return keep_mask
 
 
+def combine_ace_scores(
+    p_gsp: torch.Tensor,
+    p_rcr: torch.Tensor,
+) -> torch.Tensor:
+    """Combine normalized ACE branches after applying their fixed scales."""
+    if p_gsp.shape != p_rcr.shape:
+        raise ValueError(
+            "ACE GSP and RCR scores must have matching shapes, got "
+            f"{tuple(p_gsp.shape)} and {tuple(p_rcr.shape)}"
+        )
+    return torch.maximum(
+        ACE_GSP_COEFFICIENT * p_gsp,
+        ACE_RCR_COEFFICIENT * p_rcr,
+    )
+
+
 def build_keep_mask_dual_view(
     gate: torch.Tensor,
     topk_idx: torch.Tensor,
@@ -111,7 +131,7 @@ def build_keep_mask_dual_view(
     score_proto = compute_importance_score(gate, proto_selected)
     p_slanc = score_slanc.float() / (score_slanc.float().sum(dim=-1, keepdim=True) + eps)
     p_proto = score_proto.float() / (score_proto.float().sum(dim=-1, keepdim=True) + eps)
-    p_final = torch.maximum(p_slanc, p_proto)
+    p_final = combine_ace_scores(p_slanc, p_proto)
 
     keep_mask = p_final >= float(tau_l)
     top1_idx = gate.argmax(dim=-1, keepdim=True)
@@ -129,6 +149,8 @@ def build_keep_mask_dual_view(
         "score_proto": score_proto.detach(),
         "p_slanc": p_slanc.detach(),
         "p_proto": p_proto.detach(),
+        "p_gsp_scaled": (ACE_GSP_COEFFICIENT * p_slanc).detach(),
+        "p_rcr_scaled": (ACE_RCR_COEFFICIENT * p_proto).detach(),
         "p_final": p_final.detach(),
     }
 

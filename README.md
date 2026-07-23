@@ -7,9 +7,13 @@ combines two parameter-derived expert contribution views:
   frozen expert and normalization parameters.
 - **RCR (Router-Conditioned Refinement):** evaluates each expert along a
   router-conditioned direction derived from the layer's router weights.
-- **ACE:** normalizes the runtime gate-weighted GSP and RCR scores separately and
-  uses their elementwise maximum. A routed slot is skipped only when both views
-  assign it low contribution.
+- **ACE:** normalizes the runtime gate-weighted GSP and RCR scores separately,
+  applies fixed coefficients of `1.0` and `0.1`, respectively, and then takes
+  their elementwise maximum:
+
+  `ACE = max(1.0 * GSP, 0.1 * RCR)`.
+
+  The global threshold is applied to this combined score.
 
 The repository exposes only the methods and component ablations reported in
 the paper. `gsp` and `rcr` are retained only for the reported component study.
