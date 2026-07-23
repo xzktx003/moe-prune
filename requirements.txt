@@ -1,0 +1,26 @@
+# Base runtime environment for this repository.
+# Versions validated for the Qwen3-MoE pruning, PPL, and EvalScope workflows.
+
+torch==2.8.0
+torchvision==0.23.0
+triton==3.4.0
+transformers==5.6.2
+accelerate==1.12.0
+datasets==3.6.0
+evalscope==1.4.1
+numpy==2.2.6
+pandas==2.2.3
+matplotlib==3.10.7
+tqdm==4.67.1
+PyYAML==6.0.2
+fire==0.7.1
+loguru==0.7.3
+Pillow==11.3.0
+einops==0.8.2
+tiktoken==0.9.0
+openai==2.14.0
+qwen-vl-utils==0.0.14
+lm-eval==0.4.9.2
+
+# Optional extras for non-default paths:
+# flash-attn==2.8.3  # install separately with: pip install flash-attn==2.8.3 --no-build-isolation

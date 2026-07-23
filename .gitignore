@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+.conda/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Generated experiment artifacts
+results/
+outputs/
+outputs-*/
+logs/
+log/
+cache/
+.cache/
+storage/
+wandb/
+
+# Model and calibration artifacts
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.bin
+*.safetensors
+*.ckpt
+*.onnx
+
+# Downloaded datasets and archives
+*.parquet
+*.arrow
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
