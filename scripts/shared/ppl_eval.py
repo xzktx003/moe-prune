@@ -9,7 +9,6 @@ from typing import Dict, List
 import torch
 from datasets import load_dataset
 
-from moe_prune.code.src.aimer_selector import build_aimer_keep_table_for_model
 from moe_prune.code.src.amp_proxy import build_amp_table_for_model, build_router_proto_amp_table_for_model
 from moe_prune.code.src.model_families import add_model_selection_args, finalize_model_selection
 from moe_prune.code.src.model_adapter import (
@@ -17,14 +16,6 @@ from moe_prune.code.src.model_adapter import (
     load_qwen3_moe,
     maybe_bf16_autocast,
     patched_model_for_ace,
-    patched_model_for_gsp,
-    patched_model_for_rcr,
-    patched_model_for_aimer,
-    patched_model_for_expert_sparsity,
-    patched_model_for_score_only,
-    patched_model_for_sere,
-    patched_model_for_top_p,
-    patched_model_for_xshare,
 )
 from moe_prune.code.src.runtime_pruner import RuntimeStats
 
@@ -173,31 +164,6 @@ def parse_args():
     parser.add_argument("--n-ctx", type=int, default=2048)
     parser.add_argument("--n-batch", type=int, default=2048)
     parser.add_argument(
-        "--method",
-        choices=[
-            "ace",
-            "gsp",
-            "rcr",
-            "score_only",
-            "aimer",
-            "expert_sparsity",
-            "top_p",
-            "sere",
-            "xshare",
-        ],
-        default="ace",
-    )
-    parser.add_argument("--lambda-penalty", type=float, default=0.5)
-    parser.add_argument("--gate-guard", type=float, default=0.5)
-    parser.add_argument(
-        "--score-only-moe-backend",
-        choices=["torch", "triton"],
-        default="triton",
-        help="MoE expert backend used only when --method score_only.",
-    )
-    parser.add_argument("--similarity-mode",
-                        choices=["fast", "exact"], default="fast")
-    parser.add_argument(
         "--router-weight-centering",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -216,9 +182,9 @@ def write_markdown(path: Path, rows: List[Dict[str, float]]) -> None:
     lines = [
         (
             "| tau | ppl | delta_vs_tau0 | active_expert_pruning_ratio "
-            "| rows_used | method |"
+            "| rows_used |"
         ),
-        "| --- | --- | --- | --- | --- | --- |",
+        "| --- | --- | --- | --- | --- |",
     ]
     tau0 = rows[0]["ppl"] if rows else 0.0
     for row in rows:
@@ -228,7 +194,7 @@ def write_markdown(path: Path, rows: List[Dict[str, float]]) -> None:
                 f"| {row['tau']:.4f} | {row['ppl']:.4f} | "
                 f"{delta:+.4f} | "
                 f"{row['active_expert_pruning_ratio']:.4f} | "
-                f"{int(row['rows_used'])} | {row['method']} |"
+                f"{int(row['rows_used'])} |"
             )
         )
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -238,42 +204,16 @@ def format_tau_dir(value: float) -> str:
     return f"tau_{float(value):.4f}"
 
 
-def knob_name_for_ppl_method(method: str) -> str:
-    return "beta" if method in {"score_only", "expert_sparsity"} else "tau"
-
-
 def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer = load_qwen3_moe(args.model_path, model_family=args.model_family)
-    amp_table = (
-        None
-        if args.method in {
-            "score_only",
-            "rcr",
-            "aimer",
-            "expert_sparsity",
-            "top_p",
-            "sere",
-            "xshare",
-        }
-        else build_amp_table_for_model(model)
-    )
-    proto_amp_table = None
-    if args.method in {"rcr", "ace"}:
-        if args.router_weight_centering:
-            proto_amp_table = build_router_proto_amp_table_for_model(
-                model,
-                center_router_weights=True,
-            )
-        else:
-            proto_amp_table = build_router_proto_amp_table_for_model(model)
-    aimer_keep_table = (
-        build_aimer_keep_table_for_model(model)
-        if args.method == "aimer"
-        else None
+    amp_table = build_amp_table_for_model(model)
+    proto_amp_table = build_router_proto_amp_table_for_model(
+        model,
+        center_router_weights=args.router_weight_centering,
     )
     evaluator = FullWikiTextPerplexity(
         model=model,
@@ -286,73 +226,13 @@ def main():
     rows: List[Dict[str, float]] = []
     for tau in args.taus:
         runtime_stats = RuntimeStats()
-        if args.method == "score_only":
-            patch_ctx = patched_model_for_score_only(
-                model,
-                gate_threshold=tau,
-                runtime_stats=runtime_stats,
-                moe_backend=args.score_only_moe_backend,
-            )
-        elif args.method == "expert_sparsity":
-            patch_ctx = patched_model_for_expert_sparsity(
-                model,
-                beta=tau,
-                runtime_stats=runtime_stats,
-                moe_backend=args.score_only_moe_backend,
-            )
-        elif args.method == "top_p":
-            patch_ctx = patched_model_for_top_p(
-                model,
-                tau=tau,
-                runtime_stats=runtime_stats,
-                moe_backend=args.score_only_moe_backend,
-            )
-        elif args.method == "sere":
-            patch_ctx = patched_model_for_sere(
-                model,
-                tau=tau,
-                similarity_mode=args.similarity_mode,
-                runtime_stats=runtime_stats,
-                moe_backend=args.score_only_moe_backend,
-            )
-        elif args.method == "xshare":
-            patch_ctx = patched_model_for_xshare(
-                model,
-                tau=tau,
-                runtime_stats=runtime_stats,
-                moe_backend=args.score_only_moe_backend,
-            )
-        elif args.method == "gsp":
-            patch_ctx = patched_model_for_gsp(
-                model,
-                amp_table=amp_table,
-                tau=tau,
-                runtime_stats=runtime_stats,
-            )
-        elif args.method == "ace":
-            patch_ctx = patched_model_for_ace(
-                model,
-                slanc_amp_table=amp_table,
-                proto_amp_table=proto_amp_table,
-                tau=tau,
-                runtime_stats=runtime_stats,
-            )
-        elif args.method == "aimer":
-            patch_ctx = patched_model_for_aimer(
-                model,
-                keep_table=aimer_keep_table,
-                tau=tau,
-                runtime_stats=runtime_stats,
-            )
-        elif args.method == "rcr":
-            patch_ctx = patched_model_for_rcr(
-                model,
-                proto_amp_table=proto_amp_table,
-                tau=tau,
-                runtime_stats=runtime_stats,
-            )
-        else:
-            raise ValueError(f"Unsupported paper method: {args.method}")
+        patch_ctx = patched_model_for_ace(
+            model,
+            gsp_amp_table=amp_table,
+            rcr_amp_table=proto_amp_table,
+            tau=tau,
+            runtime_stats=runtime_stats,
+        )
         with patch_ctx:
             metrics = evaluator.calculate_corpus_ppl(
                 n_ctx=args.n_ctx, n_batch=args.n_batch)
@@ -365,34 +245,12 @@ def main():
                 ),
                 "rows_used": float(evaluator.num_rows),
                 "windows": float(metrics["windows"]),
-                "method": args.method,
-                "gate_threshold": (
-                    float(tau)
-                    if args.method == "score_only"
-                    else None
-                ),
-                "beta": (
-                    float(tau)
-                    if args.method == "expert_sparsity"
-                    else None
-                ),
             }
         )
         current_row = rows[-1]
-        if args.method in {
-            "ace",
-            "gsp",
-            "rcr",
-            "aimer",
-            "expert_sparsity",
-            "top_p",
-            "sere",
-            "xshare",
-        }:
-            knob_name = knob_name_for_ppl_method(args.method)
-            per_tau_dir = output_dir / "ppl_by_tau" / f"{knob_name}_{float(tau):.4f}"
-            write_json(per_tau_dir / "wikitext_ppl.json", current_row)
-            write_markdown(per_tau_dir / "wikitext_ppl.md", [current_row])
+        per_tau_dir = output_dir / "ppl_by_tau" / f"tau_{float(tau):.4f}"
+        write_json(per_tau_dir / "wikitext_ppl.json", current_row)
+        write_markdown(per_tau_dir / "wikitext_ppl.md", [current_row])
         write_json(output_dir / "wikitext_ppl.partial.json", rows)
         write_markdown(output_dir / "wikitext_ppl.partial.md", rows)
 

@@ -36,9 +36,9 @@ def triton_moe_available() -> bool:
 
 def _require_triton() -> None:
     if triton is None:
-        raise ImportError("Triton score_only MoE backend requires the triton package.")
+        raise ImportError("The ACE Triton MoE backend requires the triton package.")
     if not torch.cuda.is_available():
-        raise RuntimeError("Triton score_only MoE backend requires CUDA.")
+        raise RuntimeError("The ACE Triton MoE backend requires CUDA.")
 
 
 @_triton_jit
@@ -330,9 +330,9 @@ def compute_fused_expert_outputs_triton(
     """Compute per-slot expert outputs with Triton grouped GEMM."""
     _require_triton()
     if not hidden_states.is_cuda:
-        raise ValueError("Triton score_only MoE backend requires CUDA tensors.")
+        raise ValueError("The ACE Triton MoE backend requires CUDA tensors.")
     if not (hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj")):
-        raise ValueError("Triton score_only MoE backend currently supports only fused Qwen3 experts.")
+        raise ValueError("The ACE Triton MoE backend currently supports only fused Qwen3 experts.")
     if keep_mask.shape != selected_experts.shape:
         raise ValueError("keep_mask must match selected_experts shape.")
 
@@ -433,42 +433,12 @@ def compute_fused_expert_outputs_triton(
     )
 
 
-def compute_fused_experts_triton(
-    hidden_states: torch.Tensor,
-    experts,
-    selected_experts: torch.Tensor,
-    keep_mask: torch.Tensor,
-    routing_weights: torch.Tensor,
-    *,
-    block_m: int = 64,
-    block_n: int = 64,
-    group_m: int = 8,
-    block_k: int = 64,
-) -> tuple[torch.Tensor, TritonMoeStats]:
-    """Compute Qwen3 fused expert outputs with Triton grouped GEMM.
+__all__ = [
+    "TritonMoeStats",
+    "compute_fused_expert_outputs_triton",
+    "triton_moe_available",
+]
+# End of ACE Triton API.
 
-    Returns the already gate-weighted and slot-summed final hidden states with
-    the same dtype and shape as ``hidden_states``. The caller decides how to
-    build ``keep_mask`` and ``routing_weights``; score_only is only the first
-    integration point.
-    """
-    _require_triton()
-    if not hidden_states.is_cuda:
-        raise ValueError("Triton score_only MoE backend requires CUDA tensors.")
-    if not (hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj")):
-        raise ValueError("Triton score_only MoE backend currently supports only fused Qwen3 experts.")
-    if keep_mask.shape != selected_experts.shape or routing_weights.shape != selected_experts.shape:
-        raise ValueError("keep_mask and routing_weights must match selected_experts shape.")
 
-    expert_outputs, stats = compute_fused_expert_outputs_triton(
-        hidden_states,
-        experts,
-        selected_experts,
-        keep_mask,
-        block_m=block_m,
-        block_n=block_n,
-        group_m=group_m,
-        block_k=block_k,
-    )
-    final_hidden = (routing_weights.unsqueeze(-1) * expert_outputs).sum(dim=1)
-    return final_hidden, stats
+

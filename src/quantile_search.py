@@ -1,78 +1,18 @@
 """Quantile-based global threshold search (see docs/prd/快速搜索阈值方案.md).
 
-Replaces multi-round binary search with a single calibration forward followed
-by a one-shot global score quantile lookup. Only applicable to methods whose
-runtime decision is ``p_final >= tau`` against a per-slot scalar score with a
-shared, network-wide ``tau``. See ``code/scripts/shared/quantile_calibration.py``
-for the calibration entry point and ``run_ppl_search.py`` for the search wiring.
+Uses a single ACE calibration forward followed by a one-shot global score
+quantile lookup. The runtime decision is ``p_final >= tau`` against ACE's
+per-slot scalar score with a shared, network-wide ``tau``. See
+``scripts/shared/quantile_calibration.py`` for the calibration entry point.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, Tuple
+from typing import Dict, Iterable, Mapping
 
 import torch
-
-
-QUANTILE_COMPATIBLE_METHODS: Tuple[str, ...] = (
-    "ace",
-    "gsp",
-    "rcr",
-    "score_only",
-    "naee",
-    "aimer",
-    "expert_sparsity",
-    "top_p",
-    "sere",
-)
-
-
-def build_candidate_scores_from_p_final(
-    p_final: torch.Tensor,
-    min_keep: int = 1,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(candidate_scores, candidate_mask)`` for one layer's ``p_final``.
-
-    The runtime force-keeps the top-``max(min_keep, 1)`` slots ranked by
-    ``p_final`` (which equals the score's argmax for every supported method,
-    including GSP/RCR/NAEE where p_final is built from
-    ``gate * amp_selected`` and column 0 is *not* guaranteed to be the max).
-    This helper mirrors that selection so the calibration candidate pool is
-    aligned with what the runtime actually treats as prunable.
-    """
-
-    if p_final.ndim != 2:
-        raise ValueError(f"p_final must be 2D [T, k], got shape {tuple(p_final.shape)}")
-
-    keep_count = max(int(min_keep), 1)
-    keep_count = min(keep_count, p_final.shape[-1])
-    top_keep_idx = torch.topk(p_final, k=keep_count, dim=-1).indices
-    forced_keep = torch.zeros_like(p_final, dtype=torch.bool)
-    forced_keep.scatter_(dim=-1, index=top_keep_idx, value=True)
-
-    candidate_mask = ~forced_keep
-    candidate_scores = p_final[candidate_mask]
-    return candidate_scores, candidate_mask
-
-
-def fast_quantile_by_kthvalue(scores: torch.Tensor, q: float) -> torch.Tensor:
-    """Compute a 1D quantile via ``torch.kthvalue`` (no full sort).
-
-    Returns the ``q``-th quantile as a 0-D tensor; the score at rank
-    ``floor(q*(n-1)) + 1`` (1-indexed).
-    """
-
-    flat = scores.float().flatten()
-    n = flat.numel()
-    if n == 0:
-        raise ValueError("fast_quantile_by_kthvalue requires at least one score")
-
-    q = float(min(max(q, 0.0), 1.0))
-    rank = int(q * (n - 1)) + 1
-    rank = max(1, min(rank, n))
-    return torch.kthvalue(flat, rank).values
 
 
 def _target_pruned_candidate_count(
@@ -267,47 +207,15 @@ def candidate_collection_cache_matches(
     return True
 
 
-def build_global_threshold_table_by_quantile(
-    layer_score_cache: Mapping[int, Mapping[str, torch.Tensor]],
-    target_rates: Iterable[float],
-    min_keep: int = 1,
-    target_is_global_slot_rate: bool = True,
-) -> tuple[Dict[float, float], Dict[float, Dict[str, object]]]:
-    """Generate per-rate global thresholds from a calibration ``p_final`` cache.
+__all__ = [
+    "build_threshold_table_from_global_candidates",
+    "candidate_collection_cache_matches",
+    "load_candidate_collection_chunks",
+    "load_candidate_collection_meta",
+    "threshold_for_pruned_count",
+    "write_candidate_collection_meta",
+]
+# End of ACE quantile API.
 
-    ``layer_score_cache[layer_id]["p_final"]`` must be a ``[T_l, k]`` tensor of
-    the same per-slot score used by the runtime decision rule.
-    """
 
-    all_candidate_scores = []
-    total_slots = 0
-    total_candidates = 0
 
-    for cache in layer_score_cache.values():
-        p_final = cache["p_final"]
-        if not torch.is_tensor(p_final):
-            raise TypeError("layer_score_cache entries must contain torch tensors")
-        if p_final.numel() == 0:
-            continue
-
-        candidate_scores, _ = build_candidate_scores_from_p_final(
-            p_final=p_final,
-            min_keep=min_keep,
-        )
-        if candidate_scores.numel() > 0:
-            all_candidate_scores.append(candidate_scores.float().flatten())
-
-        total_slots += int(p_final.numel())
-        total_candidates += int(candidate_scores.numel())
-
-    if not all_candidate_scores:
-        raise ValueError("No candidate scores collected; check min_keep / top-k.")
-
-    global_candidates = torch.cat(all_candidate_scores, dim=0)
-
-    return build_threshold_table_from_global_candidates(
-        global_candidates=global_candidates,
-        total_slots=total_slots,
-        target_rates=target_rates,
-        target_is_global_slot_rate=target_is_global_slot_rate,
-    )

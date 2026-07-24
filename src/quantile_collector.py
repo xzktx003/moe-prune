@@ -5,27 +5,38 @@ from types import MethodType
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 
 from .model_structure import iter_moe_layer_bindings
-from .moe_cache_collector import compute_expert_outputs_local, route_qwen3_topk
-from .quantile_search import build_candidate_scores_from_p_final
-from .runtime_pruner import combine_ace_scores
-from .sere_selector import build_sere_dissimilarity_score
-from .top_p_selector import build_top_p_residual_score
+from .runtime_pruner import combine_ace_scores, compute_expert_outputs
 
 
 EPS = 1e-8
-QUANTILE_RUNTIME_METHODS = {
-    "ace",
-    "gsp",
-    "rcr",
-    "score_only",
-    "naee",
-    "aimer",
-    "expert_sparsity",
-    "top_p",
-    "sere",
-}
+
+
+def route_topk(
+    router,
+    hidden_states: torch.Tensor,
+    top_k: int,
+    norm_topk_prob: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    router_out = router(hidden_states)
+    if isinstance(router_out, tuple) and len(router_out) == 3:
+        return router_out
+    router_logits = router_out[0] if isinstance(router_out, tuple) else router_out
+    routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+    routing_weights, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    if norm_topk_prob:
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    return router_logits, routing_weights.to(hidden_states.dtype), selected_experts
+
+
+def compute_expert_outputs_local(
+    hidden_states: torch.Tensor,
+    experts,
+    selected_experts: torch.Tensor,
+) -> torch.Tensor:
+    return compute_expert_outputs(hidden_states, experts, selected_experts)
 
 
 def _selected_importance(
@@ -36,13 +47,10 @@ def _selected_importance(
     return amp_tables[layer_idx].to(device=topk_idx.device, dtype=torch.float32)[topk_idx.to(torch.long)]
 
 
-def _candidate_scores_for_method(
-    method: str,
+def ace_candidate_scores(
     p_final: torch.Tensor,
     gate: torch.Tensor,
 ) -> torch.Tensor:
-    if method != "ace":
-        return build_candidate_scores_from_p_final(p_final, min_keep=1)[0]
     forced_keep = torch.zeros_like(p_final, dtype=torch.bool)
     forced_keep.scatter_(dim=-1, index=gate.argmax(dim=-1, keepdim=True), value=True)
     return p_final[~forced_keep]
@@ -52,12 +60,10 @@ def _candidate_scores_for_method(
 def patched_model_for_quantile_collection(
     model,
     *,
-    method: str,
     candidate_scores_by_layer: Dict[int, List[torch.Tensor]],
     total_slots_by_layer: Dict[int, int],
     amp_tables: Dict[int, torch.Tensor] | None = None,
     proto_amp_tables: Dict[int, torch.Tensor] | None = None,
-    sim_tables: Dict[int, torch.Tensor] | None = None,
 ):
     originals: List[tuple[object, object]] = []
 
@@ -77,7 +83,7 @@ def patched_model_for_quantile_collection(
             def _forward(self, hidden_states, _layer_idx=layer_idx, _top_k=top_k, _norm_topk_prob=norm_topk_prob):
                 batch_size, sequence_length, hidden_dim = hidden_states.shape
                 flat_states = hidden_states.view(-1, hidden_dim)
-                _, routing_weights, selected_experts = route_qwen3_topk(
+                _, routing_weights, selected_experts = route_topk(
                     self.gate,
                     flat_states,
                     top_k=_top_k,
@@ -86,49 +92,16 @@ def patched_model_for_quantile_collection(
                 gate = routing_weights.float()
                 topk_idx = selected_experts
 
-                if method in {"score_only", "expert_sparsity"}:
-                    gate_max = gate.max(dim=-1, keepdim=True).values + EPS
-                    p_final = gate / gate_max
-                elif method == "gsp":
-                    assert amp_tables is not None
-                    amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    score = gate * amp_sel
-                    p_final = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                elif method == "ace":
-                    assert amp_tables is not None and proto_amp_tables is not None
-                    amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
-                    score_amp = gate * amp_sel
-                    score_proto = gate * proto_sel
-                    p_amp = score_amp / (score_amp.sum(dim=-1, keepdim=True) + EPS)
-                    p_proto = score_proto / (score_proto.sum(dim=-1, keepdim=True) + EPS)
-                    p_final = combine_ace_scores(p_amp, p_proto)
-                elif method == "rcr":
-                    assert proto_amp_tables is not None
-                    proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
-                    score = gate * proto_sel
-                    p_final = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                elif method == "naee":
-                    assert amp_tables is not None
-                    amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    score = gate * amp_sel
-                    score = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                    score_max = score.max(dim=-1, keepdim=True).values + EPS
-                    p_final = score / score_max
-                elif method == "aimer":
-                    assert amp_tables is not None
-                    keep_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    score = gate * keep_sel
-                    p_final = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                elif method == "top_p":
-                    p_final = build_top_p_residual_score(gate)
-                elif method == "sere":
-                    assert sim_tables is not None
-                    p_final = build_sere_dissimilarity_score(topk_idx, sim_tables[_layer_idx])
-                else:
-                    raise ValueError(f"Unsupported quantile method: {method}")
+                assert amp_tables is not None and proto_amp_tables is not None
+                amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
+                proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
+                score_amp = gate * amp_sel
+                score_proto = gate * proto_sel
+                p_amp = score_amp / (score_amp.sum(dim=-1, keepdim=True) + EPS)
+                p_proto = score_proto / (score_proto.sum(dim=-1, keepdim=True) + EPS)
+                p_final = combine_ace_scores(p_amp, p_proto)
 
-                candidate_scores = _candidate_scores_for_method(method, p_final, gate)
+                candidate_scores = ace_candidate_scores(p_final, gate)
                 if candidate_scores.numel() > 0:
                     candidate_scores_by_layer[_layer_idx].append(candidate_scores.detach().cpu())
                 total_slots_by_layer[_layer_idx] += int(p_final.numel())
@@ -149,49 +122,16 @@ def patched_model_for_quantile_collection(
                 gate = top_k_weights.float()
                 topk_idx = top_k_index
 
-                if method in {"score_only", "expert_sparsity"}:
-                    gate_max = gate.max(dim=-1, keepdim=True).values + EPS
-                    p_final = gate / gate_max
-                elif method == "gsp":
-                    assert amp_tables is not None
-                    amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    score = gate * amp_sel
-                    p_final = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                elif method == "ace":
-                    assert amp_tables is not None and proto_amp_tables is not None
-                    amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
-                    score_amp = gate * amp_sel
-                    score_proto = gate * proto_sel
-                    p_amp = score_amp / (score_amp.sum(dim=-1, keepdim=True) + EPS)
-                    p_proto = score_proto / (score_proto.sum(dim=-1, keepdim=True) + EPS)
-                    p_final = combine_ace_scores(p_amp, p_proto)
-                elif method == "rcr":
-                    assert proto_amp_tables is not None
-                    proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
-                    score = gate * proto_sel
-                    p_final = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                elif method == "naee":
-                    assert amp_tables is not None
-                    amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    score = gate * amp_sel
-                    score = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                    score_max = score.max(dim=-1, keepdim=True).values + EPS
-                    p_final = score / score_max
-                elif method == "aimer":
-                    assert amp_tables is not None
-                    keep_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
-                    score = gate * keep_sel
-                    p_final = score / (score.sum(dim=-1, keepdim=True) + EPS)
-                elif method == "top_p":
-                    p_final = build_top_p_residual_score(gate)
-                elif method == "sere":
-                    assert sim_tables is not None
-                    p_final = build_sere_dissimilarity_score(topk_idx, sim_tables[_layer_idx])
-                else:
-                    raise ValueError(f"Unsupported quantile method: {method}")
+                assert amp_tables is not None and proto_amp_tables is not None
+                amp_sel = _selected_importance(amp_tables, _layer_idx, topk_idx)
+                proto_sel = _selected_importance(proto_amp_tables, _layer_idx, topk_idx)
+                score_amp = gate * amp_sel
+                score_proto = gate * proto_sel
+                p_amp = score_amp / (score_amp.sum(dim=-1, keepdim=True) + EPS)
+                p_proto = score_proto / (score_proto.sum(dim=-1, keepdim=True) + EPS)
+                p_final = combine_ace_scores(p_amp, p_proto)
 
-                candidate_scores = _candidate_scores_for_method(method, p_final, gate)
+                candidate_scores = ace_candidate_scores(p_final, gate)
                 if candidate_scores.numel() > 0:
                     candidate_scores_by_layer[_layer_idx].append(candidate_scores.detach().cpu())
                 total_slots_by_layer[_layer_idx] += int(p_final.numel())

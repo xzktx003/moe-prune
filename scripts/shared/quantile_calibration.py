@@ -15,19 +15,15 @@ from typing import Dict, List, Sequence
 
 import torch
 
-from moe_prune.code.src.aimer_selector import build_aimer_keep_table_for_model
 from moe_prune.code.scripts.shared.ppl_eval import FullWikiTextPerplexity
 from moe_prune.code.src.amp_proxy import (
     build_amp_table_for_model,
     build_router_proto_amp_table_for_model,
 )
 from moe_prune.code.src.model_adapter import clear_hf_proxy_env, load_qwen3_moe, maybe_bf16_autocast
-from moe_prune.code.src.expert_similarity import build_model_similarity_table
 from moe_prune.code.src.model_families import add_model_selection_args, finalize_model_selection
-from moe_prune.code.src.evalscope_search import archive_incomplete_work_dir
 from moe_prune.code.src.quantile_collector import patched_model_for_quantile_collection
 from moe_prune.code.src.quantile_search import (
-    QUANTILE_COMPATIBLE_METHODS,
     build_threshold_table_from_global_candidates,
     candidate_collection_cache_matches,
     load_candidate_collection_chunks,
@@ -40,15 +36,20 @@ def parse_args(argv: Sequence[str] | None = None):
         description="Build target-rate→tau threshold table from the full unpruned evaluation forward."
     )
     add_model_selection_args(parser)
-    parser.add_argument("--method", choices=list(QUANTILE_COMPATIBLE_METHODS), required=True)
     parser.add_argument("--output-path", type=Path, required=True)
     parser.add_argument("--target-pruning-ratios", type=float, nargs="+", required=True)
     parser.add_argument("--candidate-cache-dir", type=Path, default=None)
-    parser.add_argument("--split", default="test")
+    parser.add_argument("--split", default="train")
     parser.add_argument("--text-column", default="text")
-    parser.add_argument("--min-text-length", type=int, default=512)
+    parser.add_argument("--min-text-length", type=int, default=0)
     parser.add_argument("--n-ctx", type=int, default=2048)
     parser.add_argument("--n-batch", type=int, default=2048)
+    parser.add_argument(
+        "--calibration-sequences",
+        type=int,
+        default=128,
+        help="Number of consecutive n_ctx-token WikiText training sequences (default: 128).",
+    )
     parser.add_argument(
         "--router-weight-centering",
         action=argparse.BooleanOptionalAction,
@@ -61,7 +62,7 @@ def parse_args(argv: Sequence[str] | None = None):
 def _candidate_cache_signature(args) -> Dict[str, object]:
     return {
         "source": "ppl_full_unpruned_eval_forward",
-        "method": args.method,
+        "method": "ace",
         "model_family": args.model_family,
         "model_path": args.model_path,
         "split": args.split,
@@ -69,6 +70,8 @@ def _candidate_cache_signature(args) -> Dict[str, object]:
         "min_text_length": int(args.min_text_length),
         "n_ctx": int(args.n_ctx),
         "n_batch": int(args.n_batch),
+        "calibration_sequences": int(args.calibration_sequences),
+        "calibration_tokens": int(args.calibration_sequences) * int(args.n_ctx),
         "router_weight_centering": bool(args.router_weight_centering),
     }
 
@@ -107,15 +110,14 @@ def collect_global_candidates_from_full_forward(
     model,
     tokenizer,
     *,
-    method: str,
     split: str,
     text_column: str,
     min_text_length: int,
     n_ctx: int,
     n_batch: int,
+    calibration_sequences: int,
     amp_tables: Dict[int, torch.Tensor] | None = None,
     proto_amp_tables: Dict[int, torch.Tensor] | None = None,
-    sim_tables: Dict[int, torch.Tensor] | None = None,
     chunks_dir: Path | None = None,
 ) -> tuple[torch.Tensor, int]:
     del n_batch
@@ -130,19 +132,24 @@ def collect_global_candidates_from_full_forward(
     tokens = evaluator._tokenize_for_device(runtime_device)
     max_length = n_ctx
     stride = n_ctx
-    seq_len = tokens.size(1)
+    calibration_tokens = int(calibration_sequences) * int(n_ctx)
+    if tokens.size(1) < calibration_tokens:
+        raise ValueError(
+            "WikiText calibration stream is shorter than the required "
+            f"{calibration_tokens} consecutive tokens."
+        )
+    tokens = tokens[:, :calibration_tokens]
+    seq_len = calibration_tokens
 
     candidate_scores_by_layer: Dict[int, List[torch.Tensor]] = {}
     total_slots_by_layer: Dict[int, int] = {}
     chunk_index = 0
     with patched_model_for_quantile_collection(
         model,
-        method=method,
         candidate_scores_by_layer=candidate_scores_by_layer,
         total_slots_by_layer=total_slots_by_layer,
         amp_tables=amp_tables,
         proto_amp_tables=proto_amp_tables,
-        sim_tables=sim_tables,
     ):
         for begin_loc in range(0, seq_len, stride):
             end_loc = min(begin_loc + max_length, seq_len)
@@ -184,42 +191,36 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     amp_tables = None
     proto_amp_tables = None
-    sim_tables = None
-    if args.method in {"gsp", "ace", "naee"}:
-        amp_tables = {int(k): v for k, v in build_amp_table_for_model(model).items()}
-    if args.method == "aimer":
-        amp_tables = {int(k): v for k, v in build_aimer_keep_table_for_model(model).items()}
-    if args.method in {"rcr", "ace"}:
-        proto_amp_tables = {
-            int(k): v
-            for k, v in build_router_proto_amp_table_for_model(
-                model,
-                center_router_weights=args.router_weight_centering,
-            ).items()
-        }
-    if args.method == "sere":
-        sim_tables = {int(k): v for k, v in build_model_similarity_table(model, mode="fast").items()}
+    amp_tables = {int(k): v for k, v in build_amp_table_for_model(model).items()}
+    proto_amp_tables = {
+        int(k): v
+        for k, v in build_router_proto_amp_table_for_model(
+            model,
+            center_router_weights=args.router_weight_centering,
+        ).items()
+    }
 
     cache_signature = _candidate_cache_signature(args)
     if args.candidate_cache_dir is not None and candidate_collection_cache_matches(args.candidate_cache_dir, cache_signature):
         global_candidates, total_slots, chunk_count = load_candidate_collection_chunks(args.candidate_cache_dir)
     else:
         if args.candidate_cache_dir is not None:
-            archived = archive_incomplete_work_dir(args.candidate_cache_dir)
-            if archived is not None:
-                print(f"[quantile_calibration] archived incomplete cache_dir {args.candidate_cache_dir} -> {archived}")
+            for stale_file in args.candidate_cache_dir.glob("chunk_*.pt"):
+                stale_file.unlink()
+            meta_path = args.candidate_cache_dir / "collection_meta.json"
+            if meta_path.exists():
+                meta_path.unlink()
         global_candidates, total_slots = collect_global_candidates_from_full_forward(
             model,
             tokenizer,
-            method=args.method,
             split=args.split,
             text_column=args.text_column,
             min_text_length=int(args.min_text_length),
             n_ctx=int(args.n_ctx),
             n_batch=int(args.n_batch),
+            calibration_sequences=int(args.calibration_sequences),
             amp_tables=amp_tables,
             proto_amp_tables=proto_amp_tables,
-            sim_tables=sim_tables,
             chunks_dir=args.candidate_cache_dir,
         )
         if args.candidate_cache_dir is not None:
@@ -245,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     payload = {
-        "method": args.method,
+        "method": "ace",
         "model_path": args.model_path,
         "model_family": args.model_family,
         "target_pruning_ratios": [float(x) for x in args.target_pruning_ratios],
@@ -254,6 +255,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "min_text_length": int(args.min_text_length),
         "n_ctx": int(args.n_ctx),
         "n_batch": int(args.n_batch),
+        "calibration_sequences": int(args.calibration_sequences),
+        "calibration_tokens": int(args.calibration_sequences) * int(args.n_ctx),
         "target_is_global_slot_rate": True,
         "min_keep": 1,
         "threshold_table": {f"{float(rate):.6f}": float(tau) for rate, tau in threshold_table.items()},
