@@ -34,6 +34,11 @@ Calibration uses the first consecutive `128 * 2048` tokens from the WikiText
 training split. The ACE score is
 `max(1.0 * normalized_GSP, 0.1 * normalized_RCR)`.
 
+Slots are not dropped by a fixed score threshold. They are kept in descending
+ACE-score order until their cumulative score mass covers `1 - tau`, so `tau` is
+the fraction of ACE score mass that is pruned and each token keeps its own
+number of experts. The router top-1 slot is always kept.
+
 ### 2. Evaluate WikiText-2 perplexity
 
 ```bash

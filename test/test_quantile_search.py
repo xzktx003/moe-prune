@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from moe_prune.code.src.ace_top_p import top_p_truncate
 from moe_prune.code.src.quantile_search import (
     build_threshold_table_from_global_candidates,
     candidate_collection_cache_matches,
@@ -60,8 +61,11 @@ def test_build_threshold_table_global_slot_rate_targets_runtime_metric():
         target_rates=[0.25, 0.50],
         target_is_global_slot_rate=True,
     )
-    assert 0.1 < table[0.25] < 0.2
-    assert 0.2 < table[0.50] < 0.3
+    assert table[0.25] == pytest.approx(1.0 / 3.0, abs=1e-6)
+    assert table[0.50] == pytest.approx(0.75, abs=1e-6)
+    for rate, expected_pruned in ((0.25, 1), (0.50, 2)):
+        keep = top_p_truncate(candidates.unsqueeze(0), table[rate])
+        assert candidates.numel() - int(keep.sum().item()) == expected_pruned
     assert stats[0.25]["desired_pruned_candidates"] == 1
     assert stats[0.25]["achieved_global_slot_prune_rate"] == pytest.approx(0.25, abs=1e-6)
     assert stats[0.50]["desired_pruned_candidates"] == 2

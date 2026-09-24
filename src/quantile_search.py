@@ -1,9 +1,8 @@
-"""Quantile-based global threshold search (see docs/prd/快速搜索阈值方案.md).
+"""Global ACE score collection and top-p cutoff calibration.
 
-Uses a single ACE calibration forward followed by a one-shot global score
-quantile lookup. The runtime decision is ``p_final >= tau`` against ACE's
-per-slot scalar score with a shared, network-wide ``tau``. See
-``scripts/shared/quantile_calibration.py`` for the calibration entry point.
+Uses a single ACE calibration forward followed by a pooled score-mass cutoff
+lookup. Runtime applies the resulting ``tau`` to each token's ACE scores.
+See ``scripts/shared/quantile_calibration.py`` for the calibration entry point.
 """
 
 from __future__ import annotations
@@ -13,6 +12,8 @@ from pathlib import Path
 from typing import Dict, Iterable, Mapping
 
 import torch
+
+from .ace_top_p import top_p_cutoff_for_pruned_count
 
 
 def _target_pruned_candidate_count(
@@ -120,9 +121,11 @@ def build_threshold_table_from_global_candidates(
             target_is_global_slot_rate=target_is_global_slot_rate,
         )
         q = float(desired_pruned_candidates) / float(max(total_candidates, 1))
-        global_tau, threshold_stats = threshold_for_pruned_count(flat, desired_pruned_candidates)
-        achieved_pruned_candidates = int(threshold_stats["achieved_pruned_candidates"])
-        threshold_table[rate] = float(global_tau.item())
+        # tau is the ACE score-mass fraction dropped by top-p truncation, so it
+        # is inverted from the cumulative-mass rule rather than a score quantile.
+        global_tau = top_p_cutoff_for_pruned_count(flat, desired_pruned_candidates)
+        achieved_pruned_candidates = int(desired_pruned_candidates)
+        threshold_table[rate] = float(global_tau)
         stats_table[rate] = {
             "candidate_quantile": float(q),
             "total_slots": int(total_slots),
@@ -135,9 +138,9 @@ def build_threshold_table_from_global_candidates(
             "achieved_global_slot_prune_rate": (
                 float(achieved_pruned_candidates) / float(max(total_slots, 1))
             ),
-            "global_tau": float(global_tau.item()),
+            "global_tau": float(global_tau),
             "target_is_global_slot_rate": bool(target_is_global_slot_rate),
-            "boundary_strategy": str(threshold_stats["boundary_strategy"]),
+            "boundary_strategy": "top-p-cumulative-mass",
         }
     return threshold_table, stats_table
 
@@ -216,6 +219,5 @@ __all__ = [
     "write_candidate_collection_meta",
 ]
 # End of ACE quantile API.
-
 
 

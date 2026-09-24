@@ -8,6 +8,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 import torch.nn.functional as F
 
+from .ace_top_p import top_p_truncate
 from .model_structure import iter_moe_layer_bindings
 from .triton_group_gemm import (
     compute_fused_expert_outputs_triton,
@@ -124,7 +125,10 @@ def build_keep_mask_dual_view(
     p_rcr = score_rcr.float() / (score_rcr.float().sum(dim=-1, keepdim=True) + eps)
     p_final = combine_ace_scores(p_gsp, p_rcr)
 
-    keep_mask = p_final >= float(tau_l)
+    # ACE ranks the slots; top-p decides the cutoff. Keep the smallest prefix of
+    # the ACE score whose mass covers ``1 - tau``, so each token keeps its own
+    # number of experts. The router top-1 slot is forced on below.
+    keep_mask = top_p_truncate(p_final, tau_l, eps=eps)
     top1_idx = gate.argmax(dim=-1, keepdim=True)
     keep_mask.scatter_(dim=-1, index=top1_idx, value=True)
 
